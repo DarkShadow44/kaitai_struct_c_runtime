@@ -12,11 +12,18 @@ ks_config* ks_config_create_internal(ks_log log, ks_ptr_inflate inflate, ks_ptr_
 ks_stream* ks_stream_create_from_bytes(ks_bytes* bytes);
 ks_stream* ks_stream_get_root(ks_stream* stream);
 ks_error ks_stream_get_error(ks_stream* stream);
+void ks_stream_set_error(ks_stream* stream, ks_error error);
 ks_usertype_generic* ks_usertype_get_root(ks_usertype_generic* data);
 ks_usertype_generic* ks_usertype_get_parent(ks_usertype_generic* base);
 ks_config* ks_stream_get_config(ks_stream* stream);
 ks_stream* ks_usertype_get_stream(ks_usertype_generic* base);
+typedef struct ks_getter_entry { const char* name; void* fn; } ks_getter_entry;
+
 void* ks_usertype_get_internal_read(ks_usertype_generic* base);
+void ks_usertype_set_getters(ks_usertype_generic* base, ks_getter_entry* getters);
+void* ks_usertype_find_getter(ks_usertype_generic* base, const char* name);
+void ks_usertype_set_instances_fn(ks_usertype_generic* base, ks_callback fn);
+void ks_usertype_read_instances(ks_usertype_generic* data);
 
 uint8_t ks_stream_read_u1(ks_stream* stream);
 uint16_t ks_stream_read_u2le(ks_stream* stream);
@@ -45,6 +52,7 @@ void ks_stream_align_to_byte(ks_stream* stream);
 
 ks_bytes* ks_stream_read_bytes(ks_stream* stream, int len);
 ks_bytes* ks_stream_read_bytes_term(ks_stream* stream, uint8_t terminator, ks_bool include, ks_bool consume, ks_bool eos_error);
+ks_bytes* ks_stream_read_bytes_term_multi(ks_stream* stream, ks_bytes* terminator, ks_bool include, ks_bool consume, ks_bool eos_error);
 ks_bytes* ks_stream_read_bytes_full(ks_stream* stream);
 ks_bool ks_stream_is_eof(ks_stream* stream);
 uint64_t ks_stream_get_pos(ks_stream* stream);
@@ -57,12 +65,13 @@ ks_bytes* ks_array_min_bytes(ks_usertype_generic* array);
 ks_bytes* ks_array_max_bytes(ks_usertype_generic* array);
 ks_bytes* ks_bytes_strip_right(ks_bytes* bytes, int pad);
 ks_bytes* ks_bytes_terminate(ks_bytes* bytes, int term, ks_bool include);
+ks_bytes* ks_bytes_terminate_multi(ks_bytes* bytes, ks_bytes* term, ks_bool include);
 ks_bytes* ks_bytes_process_xor_int(ks_bytes* bytes, uint64_t xor_int, int count_xor_bytes);
 ks_bytes* ks_bytes_process_xor_bytes(ks_bytes* bytes, ks_bytes* xor_bytes);
 ks_bytes* ks_bytes_process_rotate_left(ks_bytes* bytes, int count);
 int64_t ks_bytes_get_at(const ks_bytes* bytes, uint64_t index);
 
-ks_string* ks_string_concat(ks_string* s1, ks_string* s2);
+ks_string* ks_string_concat(uint64_t count, ks_string* s1, ...);
 ks_string* ks_string_from_int(ks_config* config, int64_t i, int base);
 int64_t ks_string_to_int(ks_string* str, int base);
 ks_string* ks_string_from_bytes(ks_bytes* bytes, ks_string* encoding);
@@ -81,6 +90,7 @@ ks_array_float* ks_array_float_from_data(ks_config* config, uint64_t count, ...)
 ks_array_double* ks_array_double_from_data(ks_config* config, uint64_t count, ...);
 
 ks_array_string* ks_array_string_from_data(ks_config* config, uint64_t count, ...);
+ks_array_stream* ks_array_stream_from_data(ks_config* config, uint64_t count, ...);
 ks_array_usertype_generic* ks_array_usertype_generic_from_data(ks_config* config, uint64_t count, ...);
 
 int ks_string_compare(ks_string* left, ks_string* right);
@@ -95,8 +105,8 @@ int64_t ks_bytes_max(ks_bytes* bytes);
 double ks_array_min_float(ks_usertype_generic* array);
 double ks_array_max_float(ks_usertype_generic* array);
 
-int64_t ks_mod(int64_t a, int64_t b);
-int64_t ks_div(int64_t a, int64_t b);
+int64_t ks_mod(ks_stream* stream, int64_t a, int64_t b);
+int64_t ks_div(ks_stream* stream, int64_t a, int64_t b);
 
 void* ks_alloc_data(ks_config* config, uint64_t len);
 void* ks_alloc_obj(ks_stream* stream, int size, ks_type type, int type_size, int internal_read_size, ks_usertype_generic* parent);
@@ -108,10 +118,11 @@ ks_bool ks_check_error(const ks_stream* stream, const char* file, int line);
 
 /* Internal Macros */
 
-#define KS_ASSERT(expr, message, errorcode, DEFAULT) \
-    if (expr) { \
+#define KS_ASSERT(expr, message, errorcode, DEFAULT)                  \
+    if (expr)                                                         \
+    {                                                                 \
         ks_log_error(stream, errorcode, message, __FILE__, __LINE__); \
-        return DEFAULT; \
+        return DEFAULT;                                               \
     }
 
 #define KS_ASSERT_VOID(expr, message, errorcode) \
@@ -120,10 +131,11 @@ ks_bool ks_check_error(const ks_stream* stream, const char* file, int line);
 #define KS_ASSERT_DATA(expr, message, errorcode) \
     KS_ASSERT(expr, message, errorcode, data)
 
-#define KS_CHECK(expr, DEFAULT) \
-    expr; \
-    if (ks_check_error(stream, __FILE__, __LINE__)) { \
-        return DEFAULT; \
+#define KS_CHECK(expr, DEFAULT)                     \
+    expr;                                           \
+    if (ks_check_error(stream, __FILE__, __LINE__)) \
+    {                                               \
+        return DEFAULT;                             \
     }
 
 #define KS_CHECK_VOID(expr) \
@@ -132,16 +144,34 @@ ks_bool ks_check_error(const ks_stream* stream, const char* file, int line);
 #define KS_CHECK_DATA(expr) \
     KS_CHECK(expr, data)
 
+#define KS_CHECK_DEFER(expr, failed_var, finally_label) \
+    do                                                  \
+    {                                                   \
+        expr;                                           \
+        if (ks_check_error(stream, __FILE__, __LINE__)) \
+        {                                               \
+            failed_var = 1;                             \
+            goto finally_label;                         \
+        }                                               \
+    } while (0)
+
 #if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ > 8) || __clang__
-#define FIELD(expr, type, field)                                          \
-    ({                                                              \
-        ks_usertype_generic* expr_ = (ks_usertype_generic*)(expr);                                 \
-        __auto_type ret = ((type##_internal*)ks_usertype_get_internal_read(expr_))->_get_##field((type*)expr_);    \
-        ret;                                                        \
+#define FIELD(expr, type, field)                                                                                \
+    ({                                                                                                          \
+        ks_usertype_generic* expr_ = (ks_usertype_generic*)(expr);                                              \
+        __auto_type ret = ((type##_internal*)ks_usertype_get_internal_read(expr_))->_get_##field((type*)expr_); \
+        ret;                                                                                                    \
+    })
+#define FIELD_EXTERNAL(expr, name, ret_type, type)                                         \
+    ({                                                                                     \
+        ks_usertype_generic* expr_ = (ks_usertype_generic*)(expr);                         \
+        ((ret_type (*)(type*))ks_usertype_find_getter(expr_, name))((type*)expr_);         \
     })
 #else
 #define FIELD(expr, type, field) \
     ((type##_internal*)ks_usertype_get_internal_read((ks_usertype_generic*)(expr)))->_get_##field((type*)expr)
+#define FIELD_EXTERNAL(expr, name, ret_type, type) \
+    ((ret_type (*)(type*))ks_usertype_find_getter((ks_usertype_generic*)(expr), name))((type*)(expr))
 #endif
 
 #endif

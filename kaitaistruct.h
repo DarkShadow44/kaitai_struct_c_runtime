@@ -97,6 +97,7 @@ typedef enum ks_type
     KS_TYPE_ARRAY_BYTES,
     KS_TYPE_ARRAY_USERENUM,
     KS_TYPE_ARRAY_USERTYPE,
+    KS_TYPE_ARRAY_STREAM,
     KS_TYPE_BYTES,
     KS_TYPE_USERTYPE,
     KS_TYPE_STRING,
@@ -195,6 +196,13 @@ typedef struct ks_array_bytes
     ks_bytes** data;
 } ks_array_bytes;
 
+typedef struct ks_array_stream
+{
+    ks_usertype_generic kaitai_base;
+    int64_t size;
+    ks_stream** data;
+} ks_array_stream;
+
 typedef struct ks_array_any
 {
     ks_usertype_generic kaitai_base;
@@ -222,7 +230,7 @@ static ks_bytes* ks_inflate_handler(ks_bytes* bytes)
     uint8_t* data_out = 0;
     uint64_t length_out = 0;
     z_stream strm = {0};
-    uint8_t outbuffer[1024*64];
+    uint8_t outbuffer[1024 * 64];
     int ret_zlib;
     ks_bytes* ret;
     ks_error err;
@@ -231,6 +239,7 @@ static ks_bytes* ks_inflate_handler(ks_bytes* bytes)
     err = ks_bytes_get_data(bytes, data_in);
     if (err != KS_ERROR_OKAY)
     {
+        free(data_in);
         ks_bytes_set_error(bytes, KS_ERROR_ZLIB);
         return 0;
     }
@@ -241,14 +250,19 @@ static ks_bytes* ks_inflate_handler(ks_bytes* bytes)
     strm.next_in = (Bytef*)data_in;
     strm.avail_in = length_in;
 
-    do {
+    do
+    {
         strm.next_out = outbuffer;
         strm.avail_out = sizeof(outbuffer);
 
         ret_zlib = inflate(&strm, 0);
 
-        if (length_out < strm.total_out) {
-            data_out = (uint8_t*)realloc(data_out, strm.total_out);
+        if (length_out < strm.total_out)
+        {
+            uint8_t* data_out_new = (uint8_t*)realloc(data_out, strm.total_out);
+            if (!data_out_new)
+                goto error;
+            data_out = data_out_new;
             memcpy(data_out + length_out, outbuffer, strm.total_out - length_out);
             length_out = strm.total_out;
         }
@@ -265,7 +279,7 @@ static ks_bytes* ks_inflate_handler(ks_bytes* bytes)
     free(data_out);
     return ret;
 
- error:
+error:
     free(data_in);
     free(data_out);
     ks_bytes_set_error(bytes, KS_ERROR_ZLIB);
@@ -282,7 +296,8 @@ static ks_bytes* ks_inflate_handler(ks_bytes* bytes)
 #ifdef KS_USE_ICONV
 #include <iconv.h>
 #include <errno.h>
-static ks_string* ks_str_decode_handler(ks_string* src, const char* src_enc) {
+static ks_string* ks_str_decode_handler(ks_string* src, const char* src_enc)
+{
     iconv_t cd = iconv_open("UTF-8", src_enc);
     size_t src_left = src->len;
     size_t dst_len = src->len * 2;
@@ -293,31 +308,55 @@ static ks_string* ks_str_decode_handler(ks_string* src, const char* src_enc) {
     size_t res = -1;
     ks_string* ret;
 
-    if (cd == (iconv_t) -1) {
-        if (errno == EINVAL) {
-            ks_string_set_error(src, KS_ERROR_ICONV);
-        } else {
-            ks_string_set_error(src, KS_ERROR_ICONV);
+    if (cd == (iconv_t)-1)
+    {
+        /*
+         * Unknown/unsupported encoding names should not fail parsing:
+         * keep source bytes as-is and let callers proceed.
+         */
+        free(dst);
+        if (errno == EINVAL)
+        {
+            return src;
         }
+        ks_string_set_error(src, KS_ERROR_ICONV);
+        return src;
     }
 
-    while (res == (size_t) -1) {
+    while (res == (size_t)-1)
+    {
         res = iconv(cd, &src_ptr, &src_left, &dst_ptr, &dst_left);
-        if (res == (size_t) -1) {
-            if (errno == E2BIG) {
+        if (res == (size_t)-1)
+        {
+            if (errno == E2BIG)
+            {
                 size_t dst_used = dst_len - dst_left;
                 dst_left += dst_len;
                 dst_len += dst_len;
-                dst = (char*)realloc(dst, dst_len + 1); /* Alloc one more for null terminator */
+                {
+                    char* dst_new = (char*)realloc(dst, dst_len + 1); /* Alloc one more for null terminator */
+                    if (!dst_new)
+                    {
+                        free(dst);
+                        ks_string_set_error(src, KS_ERROR_ICONV);
+                        return src;
+                    }
+                    dst = dst_new;
+                }
                 dst_ptr = &dst[dst_used];
                 memset(dst_ptr, 0, dst_left + 1); /* Alloc one more for null terminator */
-            } else {
+            }
+            else
+            {
+                free(dst);
                 ks_string_set_error(src, KS_ERROR_ICONV);
+                return src;
             }
         }
     }
 
-    if (iconv_close(cd) != 0) {
+    if (iconv_close(cd) != 0)
+    {
         ks_string_set_error(src, KS_ERROR_ICONV);
     }
 

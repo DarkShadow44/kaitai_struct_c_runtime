@@ -11,6 +11,7 @@ struct ks_stream
     uint64_t pos;
     uint64_t bits;
     int bits_left;
+    struct ks_usertype_generic* root_data;
     struct ks_stream* parent;
 };
 
@@ -23,8 +24,10 @@ struct ks_handle
     void* data;
     ks_type type;
     int type_size;
-    void* write_func; /* To write back */
+    void* write_func;   /* To write back */
     uint64_t last_size; /* To make sure the size when writing back isn't too big */
+    ks_callback instances_fn;
+    ks_getter_entry* getters;
 };
 
 struct ks_bytes
@@ -53,7 +56,7 @@ struct ks_config
     ks_log log;
     struct ks_memory_info* meminfo_start;
     struct ks_memory_info* meminfo_current;
-    void **meminfo_last_realloc;
+    void** meminfo_last_realloc;
 };
 
 #define HANDLE(expr) \
@@ -61,22 +64,26 @@ struct ks_config
 
 #define VOID
 
-#define min(a,b) (((a) < (b)) ? (a) : (b))
-#define max(a,b) (((a) > (b)) ? (a) : (b))
+#define min(a, b) (((a) < (b)) ? (a) : (b))
+#define max(a, b) (((a) > (b)) ? (a) : (b))
 
-#define REVERSE_FUNC(type) \
-    static void reverse_##type(type* data, int len) { \
-        int start = 0, end = len - 1; \
-        while (start < end) { \
-            type temp = data[start]; \
-            data[start] = data[end]; \
-            data[end] = temp; \
-            start++; \
-            end--; \
-        } \
+#define REVERSE_FUNC(type)                          \
+    static void reverse_##type(type* data, int len) \
+    {                                               \
+        int start = 0, end = len - 1;               \
+        while (start < end)                         \
+        {                                           \
+            type temp = data[start];                \
+            data[start] = data[end];                \
+            data[end] = temp;                       \
+            start++;                                \
+            end--;                                  \
+        }                                           \
     }
 
 REVERSE_FUNC(uint8_t);
+
+static int64_t bytes_find_term_multi_pos(const uint8_t* data, uint64_t max_len, const uint8_t* term_data, uint64_t term_len);
 
 static void** ks_alloc_internal(ks_config* config, uint64_t len)
 {
@@ -120,6 +127,10 @@ void* ks_alloc_obj(ks_stream* stream, int size, ks_type type, int type_size, int
 {
     ks_usertype_generic* ret = ks_alloc_data(stream->config, size);
     ret->handle = ks_handle_create_internal(stream, ret, type, type_size, internal_read_size, parent);
+    if (!parent && !stream->root_data)
+    {
+        stream->root_data = ret;
+    }
     return ret;
 }
 
@@ -144,13 +155,13 @@ void* ks_realloc(ks_config* config, void* old, uint64_t len)
         int i;
         for (i = 0; i < meminfo->count; i++)
         {
-           if (meminfo->data[i] == old)
-           {
-               void* ret = realloc(old, len);
-               meminfo->data[i] = ret;
-               config->meminfo_last_realloc = &meminfo->data[i];
-               return ret;
-           }
+            if (meminfo->data[i] == old)
+            {
+                void* ret = realloc(old, len);
+                meminfo->data[i] = ret;
+                config->meminfo_last_realloc = &meminfo->data[i];
+                return ret;
+            }
         }
         meminfo = meminfo->next;
     }
@@ -220,7 +231,7 @@ ks_stream* ks_stream_create_from_bytes(ks_bytes* bytes)
     ret->is_file = stream->is_file;
     if (bytes->data_direct)
     {
-        ret->data  = bytes->data_direct;
+        ret->data = bytes->data_direct;
         ret->is_file = 0;
         ret->start = 0;
     }
@@ -303,9 +314,10 @@ static void stream_read_bytes(ks_stream* stream, uint64_t len, void* bytes)
 static int64_t stream_read_int(ks_stream* stream, int len, ks_bool big_endian)
 {
     uint8_t bytes[8];
-    int64_t ret = 0;
+    uint64_t ret = 0;
     int i;
 
+    ks_stream_align_to_byte(stream);
     KS_CHECK(stream_read_bytes(stream, len, bytes), 0);
 
     if (big_endian)
@@ -315,15 +327,15 @@ static int64_t stream_read_int(ks_stream* stream, int len, ks_bool big_endian)
 
     for (i = 0; i < len; i++)
     {
-        ret += (int64_t)bytes[i] << (i*8);
+        ret |= (uint64_t)bytes[i] << (i * 8);
     }
-    return ret;
+    return (int64_t)ret;
 }
 
 static ks_bool is_big_endian(void)
 {
     int n = 1;
-    return *(char *)&n == 0;
+    return *(char*)&n == 0;
 }
 
 static float stream_read_float(ks_stream* stream, ks_bool big_endian)
@@ -331,6 +343,7 @@ static float stream_read_float(ks_stream* stream, ks_bool big_endian)
     float value;
     uint8_t bytes[sizeof(value)];
 
+    ks_stream_align_to_byte(stream);
     KS_CHECK(stream_read_bytes(stream, sizeof(bytes), bytes), 0);
 
     if (big_endian != is_big_endian())
@@ -347,6 +360,7 @@ static double stream_read_double(ks_stream* stream, ks_bool big_endian)
     double value;
     uint8_t bytes[sizeof(value)];
 
+    ks_stream_align_to_byte(stream);
     KS_CHECK(stream_read_bytes(stream, sizeof(bytes), bytes), 0);
 
     if (big_endian != is_big_endian())
@@ -357,7 +371,6 @@ static double stream_read_double(ks_stream* stream, ks_bool big_endian)
     memcpy(&value, bytes, sizeof(bytes));
     return value;
 }
-
 
 uint8_t ks_stream_read_u1(ks_stream* stream)
 {
@@ -456,7 +469,6 @@ int64_t ks_stream_read_s8be(ks_stream* stream)
     return temp;
 }
 
-
 void ks_stream_align_to_byte(ks_stream* stream)
 {
     stream->bits = 0;
@@ -514,7 +526,7 @@ uint64_t ks_stream_read_bits_be(ks_stream* stream, int width)
 
         new_bits = res;
         res = res >> stream->bits_left | (bits_needed < 64 ? stream->bits << bits_needed : 0); /* avoid undefined behavior of x << 64 */
-        stream->bits = new_bits; /* will be masked at the end of the function */
+        stream->bits = new_bits;                                                               /* will be masked at the end of the function */
     }
     else
     {
@@ -540,7 +552,8 @@ uint64_t ks_stream_read_bits_le(ks_stream* stream, int width)
         int bytes_needed = ((bits_needed - 1) / 8) + 1;
         KS_ASSERT(bytes_needed > 8, "More than 8 bytes requested", KS_ERROR_BIT_VAR_TOO_BIG, 0);
         KS_CHECK(stream_read_bytes(stream, bytes_needed, buf), 0);
-        for (i = 0; i < bytes_needed; i++) {
+        for (i = 0; i < bytes_needed; i++)
+        {
             res |= (uint64_t)(buf[i]) << (i * 8);
         }
 
@@ -568,6 +581,7 @@ ks_bytes* ks_stream_read_bytes(ks_stream* stream, int len)
 {
     ks_bytes* ret = ks_alloc_obj(stream, sizeof(ks_bytes), KS_TYPE_BYTES, sizeof(uint8_t), 0, 0);
 
+    ks_stream_align_to_byte(stream);
     KS_ASSERT(stream->pos + len > stream->length, "End of stream", KS_ERROR_END_OF_STREAM, ret);
 
     ret->length = len;
@@ -583,18 +597,37 @@ ks_bytes* ks_stream_read_bytes_term(ks_stream* stream, uint8_t terminator, ks_bo
     ks_bytes* ret = ks_alloc_obj(stream, sizeof(ks_bytes), KS_TYPE_BYTES, sizeof(uint8_t), 0, 0);
     uint8_t byte;
     uint64_t start = stream->pos;
-    uint64_t len;
-    do
-    {
-        KS_CHECK(stream_read_bytes(stream, 1, &byte), ret);
-    } while(byte != terminator);
+    uint64_t len = 0;
+    ks_bool found = 0;
 
-    len = stream->pos - start;
-    if (!consume)
+    ks_stream_align_to_byte(stream);
+    while (1)
+    {
+        if (stream->pos >= stream->length)
+        {
+            if (eos_error)
+            {
+                ks_log_error(stream, KS_ERROR_END_OF_STREAM, "End of stream", __FILE__, __LINE__);
+                ret->pos = start;
+                ret->length = 0;
+                return ret;
+            }
+            break;
+        }
+        KS_CHECK(stream_read_bytes(stream, 1, &byte), ret);
+        len++;
+        if (byte == terminator)
+        {
+            found = 1;
+            break;
+        }
+    }
+
+    if (found && !consume)
     {
         stream->pos--;
     }
-    if (!include)
+    if (found && !include)
     {
         len--;
     }
@@ -605,10 +638,69 @@ ks_bytes* ks_stream_read_bytes_term(ks_stream* stream, uint8_t terminator, ks_bo
     return ret;
 }
 
+ks_bytes* ks_stream_read_bytes_term_multi(ks_stream* stream, ks_bytes* terminator, ks_bool include, ks_bool consume, ks_bool eos_error)
+{
+    ks_bytes* ret = ks_alloc_obj(stream, sizeof(ks_bytes), KS_TYPE_BYTES, sizeof(uint8_t), 0, 0);
+    uint64_t terminator_len = ks_bytes_get_length(terminator);
+    uint8_t* terminator_data = malloc(terminator_len);
+    uint8_t* scan_data = malloc(stream->length - stream->pos);
+    uint64_t start = stream->pos;
+    uint64_t max_len = stream->length - start;
+    int64_t len;
+    ks_bool found;
+
+    ks_stream_align_to_byte(stream);
+    if (ks_bytes_get_data(terminator, terminator_data) != KS_ERROR_OKAY)
+    {
+        free(terminator_data);
+        free(scan_data);
+        return ret;
+    }
+    KS_CHECK(stream_read_bytes_nomove(stream, start, max_len, scan_data), ret);
+
+    len = bytes_find_term_multi_pos(scan_data, max_len, terminator_data, terminator_len);
+    found = len != -1;
+    if (!found)
+    {
+        stream->pos = stream->length;
+        ret->pos = start;
+        ret->length = max_len;
+        if (eos_error)
+        {
+            ret->length = 0;
+            ks_log_error(stream, KS_ERROR_END_OF_STREAM, "End of stream", __FILE__, __LINE__);
+        }
+        free(terminator_data);
+        free(scan_data);
+        return ret;
+    }
+
+    stream->pos += len;
+
+    if (found)
+    {
+        if (consume)
+        {
+            stream->pos += terminator_len;
+        }
+        if (include)
+        {
+            len += terminator_len;
+        }
+    }
+
+    ret->length = len;
+    ret->pos = start;
+    free(terminator_data);
+    free(scan_data);
+    return ret;
+}
+
 ks_bytes* ks_stream_read_bytes_full(ks_stream* stream)
 {
     ks_bytes* ret = ks_alloc_obj(stream, sizeof(ks_bytes), KS_TYPE_BYTES, sizeof(uint8_t), 0, 0);
 
+    ks_stream_align_to_byte(stream);
     ret->length = stream->length - stream->pos;
     ret->pos = stream->pos;
 
@@ -656,7 +748,7 @@ ks_bytes* ks_bytes_from_data_terminated(ks_config* config, ...)
     va_start(list, config);
     for (i = 0; i < count; i++)
     {
-        ret->data_direct[i] =  va_arg(list, int);
+        ret->data_direct[i] = va_arg(list, int);
     }
     va_end(list);
 
@@ -688,7 +780,7 @@ uint64_t ks_bytes_get_length(const ks_bytes* bytes)
 
 ks_error ks_bytes_get_data(const ks_bytes* bytes, void* data)
 {
-    const ks_stream *stream = HANDLE(bytes)->stream;
+    const ks_stream* stream = HANDLE(bytes)->stream;
     if (bytes->data_direct)
     {
         memcpy(data, bytes->data_direct, bytes->length);
@@ -702,7 +794,7 @@ ks_error ks_bytes_get_data(const ks_bytes* bytes, void* data)
 
 int64_t ks_bytes_get_at(const ks_bytes* bytes, uint64_t index)
 {
-    const ks_stream *stream = HANDLE(bytes)->stream;
+    const ks_stream* stream = HANDLE(bytes)->stream;
     if (index >= bytes->length)
     {
         return 0;
@@ -762,54 +854,134 @@ ks_bytes* ks_bytes_terminate(ks_bytes* bytes, int term, ks_bool include)
     return ret;
 }
 
+ks_bytes* ks_bytes_terminate_multi(ks_bytes* bytes, ks_bytes* term, ks_bool include)
+{
+    ks_bytes* ret = ks_alloc_obj(HANDLE(bytes)->stream, sizeof(ks_bytes), KS_TYPE_BYTES, sizeof(uint8_t), 0, 0);
+    int64_t len;
+    uint64_t max_len = bytes->length;
+    uint64_t term_len = ks_bytes_get_length(term);
+    uint8_t* term_data;
+    ks_bool found;
+
+    ret->data_direct = ks_alloc_data(HANDLE(bytes)->stream->config, max_len);
+    if (ks_bytes_get_data(bytes, ret->data_direct) != KS_ERROR_OKAY)
+    {
+        ret->length = 0;
+        return ret;
+    }
+
+    term_data = malloc(term_len);
+    if (ks_bytes_get_data(term, term_data) != KS_ERROR_OKAY)
+    {
+        ret->length = 0;
+        free(term_data);
+        return ret;
+    }
+
+    len = bytes_find_term_multi_pos(ret->data_direct, max_len, term_data, term_len);
+    found = len != -1;
+    if (!found)
+        len = max_len;
+    if (include && found)
+        len += term_len;
+
+    ret->length = len;
+    free(term_data);
+    return ret;
+}
+
+static int64_t bytes_find_term_multi_pos(const uint8_t* data, uint64_t max_len, const uint8_t* term_data, uint64_t term_len)
+{
+    int64_t pos = 0;
+    ks_bool all_zero_term = 1;
+    ks_bool can_fit;
+    uint64_t i;
+
+    if (term_len == 0)
+    {
+        return 0;
+    }
+
+    for (i = 0; i < term_len; i++)
+    {
+        if (term_data[i] != 0)
+        {
+            all_zero_term = 0;
+            break;
+        }
+    }
+
+    while (pos < max_len)
+    {
+        /* UTF16 workaround. Don't match those on odd positions */
+        if (all_zero_term && term_len > 1 && (pos % term_len) != 0)
+        {
+            pos++;
+            continue;
+        }
+        can_fit = (pos + term_len <= max_len);
+        if (!can_fit)
+        {
+            return -1;
+        }
+        if (memcmp(&data[pos], term_data, term_len) == 0)
+        {
+            return pos;
+        }
+        pos++;
+    }
+
+    return -1;
+}
+
 static int64_t array_get_int(ks_usertype_generic* array, void* data)
 {
     ks_handle* handle = array->handle;
-    switch(handle->type)
+    switch (handle->type)
     {
-        case KS_TYPE_ARRAY_UINT:
-            switch(handle->type_size)
-            {
-                case 1:
-                    return *(uint8_t*)data;
-                case 2:
-                    return *(uint16_t*)data;
-                case 4:
-                    return *(uint32_t*)data;
-                case 8:
-                    return *(uint64_t*)data;
-            }
-          case KS_TYPE_ARRAY_INT:
-            switch(handle->type_size)
-            {
-                case 1:
-                    return *(int8_t*)data;
-                case 2:
-                    return *(int16_t*)data;
-                case 4:
-                    return *(int32_t*)data;
-                case 8:
-                    return *(int64_t*)data;
-            }
-        default:
-            break;
+    case KS_TYPE_ARRAY_UINT:
+        switch (handle->type_size)
+        {
+        case 1:
+            return *(uint8_t*)data;
+        case 2:
+            return *(uint16_t*)data;
+        case 4:
+            return *(uint32_t*)data;
+        case 8:
+            return *(uint64_t*)data;
+        }
+    case KS_TYPE_ARRAY_INT:
+        switch (handle->type_size)
+        {
+        case 1:
+            return *(int8_t*)data;
+        case 2:
+            return *(int16_t*)data;
+        case 4:
+            return *(int32_t*)data;
+        case 8:
+            return *(int64_t*)data;
+        }
+    default:
+        break;
     }
     return 0;
 }
 
 static double array_get_float(ks_usertype_generic* array, void* data)
 {
-   ks_handle* handle = array->handle;
-   if (handle->type == KS_TYPE_ARRAY_FLOAT)
-   {
-       switch (handle->type_size)
-       {
-           case 4:
-               return *(float*)data;
-           case 8:
-               return *(double*)data;
-       }
-   }
+    ks_handle* handle = array->handle;
+    if (handle->type == KS_TYPE_ARRAY_FLOAT)
+    {
+        switch (handle->type_size)
+        {
+        case 4:
+            return *(float*)data;
+        case 8:
+            return *(double*)data;
+        }
+    }
     return 0;
 }
 
@@ -820,34 +992,34 @@ static ks_bool array_min_max_func(ks_usertype_generic* array, ks_bool max, void*
     {
         switch (handle->type)
         {
-            case KS_TYPE_ARRAY_UINT:
-            case KS_TYPE_ARRAY_INT:
-                return array_get_int(array, other) > array_get_int(array, minmax);
-            case KS_TYPE_ARRAY_FLOAT:
-                return array_get_float(array, other) > array_get_float(array, minmax);
-            case KS_TYPE_ARRAY_STRING:
-                return ks_string_compare(*(ks_string**)other, *(ks_string**)minmax) > 0;
-            case KS_TYPE_ARRAY_BYTES:
-                return ks_bytes_compare(*(ks_bytes**)other, *(ks_bytes**)minmax) > 0;
-            default:
-                break;
+        case KS_TYPE_ARRAY_UINT:
+        case KS_TYPE_ARRAY_INT:
+            return array_get_int(array, other) > array_get_int(array, minmax);
+        case KS_TYPE_ARRAY_FLOAT:
+            return array_get_float(array, other) > array_get_float(array, minmax);
+        case KS_TYPE_ARRAY_STRING:
+            return ks_string_compare(*(ks_string**)other, *(ks_string**)minmax) > 0;
+        case KS_TYPE_ARRAY_BYTES:
+            return ks_bytes_compare(*(ks_bytes**)other, *(ks_bytes**)minmax) > 0;
+        default:
+            break;
         }
     }
     else
     {
         switch (handle->type)
         {
-            case KS_TYPE_ARRAY_UINT:
-            case KS_TYPE_ARRAY_INT:
-                return array_get_int(array, other) < array_get_int(array, minmax);
-            case KS_TYPE_ARRAY_FLOAT:
-                return array_get_float(array, other) < array_get_float(array, minmax);
-            case KS_TYPE_ARRAY_STRING:
-                return ks_string_compare(*(ks_string**)other, *(ks_string**)minmax) < 0;
-            case KS_TYPE_ARRAY_BYTES:
-                return ks_bytes_compare(*(ks_bytes**)other, *(ks_bytes**)minmax) < 0;
-            default:
-                break;
+        case KS_TYPE_ARRAY_UINT:
+        case KS_TYPE_ARRAY_INT:
+            return array_get_int(array, other) < array_get_int(array, minmax);
+        case KS_TYPE_ARRAY_FLOAT:
+            return array_get_float(array, other) < array_get_float(array, minmax);
+        case KS_TYPE_ARRAY_STRING:
+            return ks_string_compare(*(ks_string**)other, *(ks_string**)minmax) < 0;
+        case KS_TYPE_ARRAY_BYTES:
+            return ks_bytes_compare(*(ks_bytes**)other, *(ks_bytes**)minmax) < 0;
+        default:
+            break;
         }
     }
     return 0;
@@ -978,13 +1150,38 @@ int64_t ks_bytes_max(ks_bytes* bytes)
     return bytes_minmax(bytes, 1);
 }
 
-ks_string* ks_string_concat(ks_string* s1, ks_string* s2)
+ks_string* ks_string_concat(uint64_t count, ks_string* s1, ...)
 {
-    ks_string* ret = ks_alloc_obj(HANDLE(s1)->stream, sizeof(ks_string), KS_TYPE_STRING, sizeof(char), 0, 0);
-    ret->len = s1->len + s2->len;
+    va_list list;
+    int i;
+    ks_string* ret;
+    uint64_t size = s1->len;
+    uint64_t pos = s1->len;
+    if (count <= 1)
+    {
+        return s1;
+    }
+    va_start(list, s1);
+    for (i = 0; i < count - 1; i++)
+    {
+        ks_string* str = va_arg(list, ks_string*);
+        size += str->len;
+    }
+    va_end(list);
+
+    ret = ks_alloc_obj(HANDLE(s1)->stream, sizeof(ks_string), KS_TYPE_STRING, sizeof(char), 0, 0);
+    ret->len = size;
     ret->data = ks_alloc_data(HANDLE(s1)->stream->config, ret->len + 1);
     memcpy(ret->data, s1->data, s1->len);
-    memcpy(ret->data + s1->len, s2->data, s2->len);
+
+    va_start(list, s1);
+    for (i = 0; i < count - 1; i++)
+    {
+        ks_string* str = va_arg(list, ks_string*);
+        memcpy(ret->data + pos, str->data, str->len);
+        pos += str->len;
+    }
+    va_end(list);
 
     return ret;
 }
@@ -1001,7 +1198,7 @@ ks_string* ks_string_from_int(ks_config* config, int64_t i, int base)
     {
         sprintf(buf, "%llx", (long long int)i);
     }
-    
+
     ret->len = strlen(buf);
     ret->data = ks_alloc_data(config, ret->len + 1);
     memcpy(ret->data, buf, ret->len);
@@ -1049,7 +1246,7 @@ ks_string* ks_string_from_bytes(ks_bytes* bytes, ks_string* encoding)
 
     tmp->len = bytes->length;
     tmp->data = ks_alloc_data(HANDLE(bytes)->stream->config, tmp->len + 1);
-    if(ks_bytes_get_data(bytes, tmp->data) != KS_ERROR_OKAY)
+    if (ks_bytes_get_data(bytes, tmp->data) != KS_ERROR_OKAY)
     {
         tmp->len = 0;
     }
@@ -1078,17 +1275,18 @@ ks_string* ks_string_substr(ks_string* str, int start, int end)
     return ret;
 }
 
-#define ARRAY_FROM_DATA(config, type_array, type_element, type_enum) \
+#define ARRAY_FROM_DATA(config, type_array, type_element, type_enum)                                                \
     type_array* ret = ks_alloc_obj(config->fake_stream, sizeof(type_array), type_enum, sizeof(type_element), 0, 0); \
-    va_list list; \
-    int i; \
-    ret->size = count; \
-    ret->data = ks_alloc_data(config, sizeof(type_element) * count); \
-    va_start(list, count); \
-    for (i = 0; i < count; i++) {  \
-        ret->data[i] = va_arg(list, type_element);  \
-    }  \
-    va_end(list);  \
+    va_list list;                                                                                                   \
+    int i;                                                                                                          \
+    ret->size = count;                                                                                              \
+    ret->data = ks_alloc_data(config, sizeof(type_element) * count);                                                \
+    va_start(list, count);                                                                                          \
+    for (i = 0; i < count; i++)                                                                                     \
+    {                                                                                                               \
+        ret->data[i] = va_arg(list, type_element);                                                                  \
+    }                                                                                                               \
+    va_end(list);                                                                                                   \
     return ret;
 
 ks_array_int8_t* ks_array_int8_t_from_data(ks_config* config, uint64_t count, ...)
@@ -1113,22 +1311,22 @@ ks_array_int64_t* ks_array_int64_t_from_data(ks_config* config, uint64_t count, 
 
 ks_array_uint8_t* ks_array_uint8_t_from_data(ks_config* config, uint64_t count, ...)
 {
-    ARRAY_FROM_DATA(config, ks_array_uint8_t, int, KS_TYPE_ARRAY_INT);
+    ARRAY_FROM_DATA(config, ks_array_uint8_t, int, KS_TYPE_ARRAY_UINT);
 }
 
 ks_array_uint16_t* ks_array_uint16_t_from_data(ks_config* config, uint64_t count, ...)
 {
-    ARRAY_FROM_DATA(config, ks_array_uint16_t, int, KS_TYPE_ARRAY_INT);
+    ARRAY_FROM_DATA(config, ks_array_uint16_t, int, KS_TYPE_ARRAY_UINT);
 }
 
 ks_array_uint32_t* ks_array_uint32_t_from_data(ks_config* config, uint64_t count, ...)
 {
-    ARRAY_FROM_DATA(config, ks_array_uint32_t, uint32_t, KS_TYPE_ARRAY_INT);
+    ARRAY_FROM_DATA(config, ks_array_uint32_t, uint32_t, KS_TYPE_ARRAY_UINT);
 }
 
 ks_array_uint64_t* ks_array_uint64_t_from_data(ks_config* config, uint64_t count, ...)
 {
-    ARRAY_FROM_DATA(config, ks_array_uint64_t, uint64_t, KS_TYPE_ARRAY_INT);
+    ARRAY_FROM_DATA(config, ks_array_uint64_t, uint64_t, KS_TYPE_ARRAY_UINT);
 }
 
 ks_array_float* ks_array_float_from_data(ks_config* config, uint64_t count, ...)
@@ -1144,6 +1342,11 @@ ks_array_double* ks_array_double_from_data(ks_config* config, uint64_t count, ..
 ks_array_string* ks_array_string_from_data(ks_config* config, uint64_t count, ...)
 {
     ARRAY_FROM_DATA(config, ks_array_string, ks_string*, KS_TYPE_ARRAY_STRING);
+}
+
+ks_array_stream* ks_array_stream_from_data(ks_config* config, uint64_t count, ...)
+{
+    ARRAY_FROM_DATA(config, ks_array_stream, ks_stream*, KS_TYPE_ARRAY_STREAM);
 }
 
 ks_array_usertype_generic* ks_array_usertype_generic_from_data(ks_config* config, uint64_t count, ...)
@@ -1194,22 +1397,23 @@ int ks_bytes_compare(ks_bytes* left, ks_bytes* right)
     return ret;
 }
 
-int64_t ks_mod(int64_t a, int64_t b)
+int64_t ks_mod(ks_stream* stream, int64_t a, int64_t b)
 {
     int64_t r;
-    if (b <= 0)
-    {
-        return 0;
-    }
+    KS_ASSERT(b <= 0, "Modulo divisor must be positive", KS_ERROR_OTHER, 0);
     r = a % b;
-    if (r < 0) r += b;
+    if (r < 0)
+        r += b;
     return r;
 }
 
-int64_t ks_div(int64_t a, int64_t b)
+int64_t ks_div(ks_stream* stream, int64_t a, int64_t b)
 {
-    int64_t ret = a / b;
-    int64_t mod = a %b;
+    int64_t ret;
+    int64_t mod;
+    KS_ASSERT(b == 0, "Division by zero", KS_ERROR_OTHER, 0);
+    ret = a / b;
+    mod = a % b;
     if (a < 0 && b > 0 && mod != 0)
     {
         ret--;
@@ -1271,10 +1475,13 @@ ks_bytes* ks_bytes_process_xor_bytes(ks_bytes* bytes, ks_bytes* xor_bytes)
 ks_bytes* ks_bytes_process_rotate_left(ks_bytes* bytes, int count)
 {
     uint64_t i;
-    ks_bytes* ret = ks_alloc_obj(HANDLE(bytes)->stream, sizeof(ks_bytes), KS_TYPE_BYTES, sizeof(uint8_t), 0, 0);
+    ks_stream* stream = HANDLE(bytes)->stream;
+    ks_bytes* ret = ks_alloc_obj(stream, sizeof(ks_bytes), KS_TYPE_BYTES, sizeof(uint8_t), 0, 0);
+
+    KS_ASSERT(count < 0 || count > 7, "Rotation amount must be in range 0-7", KS_ERROR_OTHER, ret);
 
     ret->length = bytes->length;
-    ret->data_direct = ks_alloc_data(HANDLE(bytes)->stream->config, bytes->length);
+    ret->data_direct = ks_alloc_data(stream->config, bytes->length);
 
     if (ks_bytes_get_data(bytes, ret->data_direct) != KS_ERROR_OKAY)
     {
@@ -1310,11 +1517,17 @@ void ks_string_set_error(ks_string* str, ks_error error)
 
 ks_usertype_generic* ks_usertype_get_root(ks_usertype_generic* data)
 {
+    ks_usertype_generic* top = data;
     while (data->handle->parent)
     {
         data = data->handle->parent;
     }
-    return data;
+    top = data;
+    if (top->handle->stream->root_data == top)
+    {
+        return top;
+    }
+    return 0;
 }
 
 ks_usertype_generic* ks_usertype_get_parent(ks_usertype_generic* base)
@@ -1334,7 +1547,7 @@ ks_config* ks_stream_get_config(ks_stream* stream)
 
 ks_stream* ks_usertype_get_stream(ks_usertype_generic* base)
 {
-     return base->handle->stream;
+    return base->handle->stream;
 }
 
 void* ks_usertype_get_internal_read(ks_usertype_generic* base)
@@ -1342,9 +1555,42 @@ void* ks_usertype_get_internal_read(ks_usertype_generic* base)
     return base->handle->internal_read;
 }
 
+void ks_usertype_set_getters(ks_usertype_generic* base, ks_getter_entry* getters)
+{
+    base->handle->getters = getters;
+}
+
+void* ks_usertype_find_getter(ks_usertype_generic* base, const char* name)
+{
+    ks_getter_entry* entry = base->handle->getters;
+    while (entry && entry->name)
+    {
+        if (strcmp(entry->name, name) == 0)
+            return entry->fn;
+        entry++;
+    }
+    return 0;
+}
+
+void ks_usertype_set_instances_fn(ks_usertype_generic* base, ks_callback fn)
+{
+    base->handle->instances_fn = fn;
+}
+
+void ks_usertype_read_instances(ks_usertype_generic* data)
+{
+    if (data && data->handle->instances_fn)
+        data->handle->instances_fn(data);
+}
+
 ks_error ks_stream_get_error(ks_stream* stream)
 {
     return stream->config->error;
+}
+
+void ks_stream_set_error(ks_stream* stream, ks_error error)
+{
+    stream->config->error = error;
 }
 
 ks_bytes* ks_inflate(ks_config* config, ks_bytes* bytes)
